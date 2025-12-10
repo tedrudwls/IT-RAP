@@ -1,4 +1,3 @@
-from sympy import per
 from stargan_model import Generator, Discriminator
 from torchvision.utils import save_image
 import torch
@@ -11,6 +10,7 @@ import random
 import math
 import gc
 import time
+from torchvision import transforms
 
 from torchvision.models import vgg19, resnet50, VGG19_Weights, ResNet50_Weights
 from torch.nn.utils import clip_grad_norm_ # Gradient Clipping
@@ -32,6 +32,9 @@ from meso_net import Meso4, MesoInception4, convert_tf_weights_to_pytorch
 
 from attgan.attgan_init import attgan_model
 import attgan_attacks
+
+from ellzaf_ml.models import GhostFaceNetsV2
+import neptune
 
 # To maintain test reproducibility
 np.random.seed(0)
@@ -241,9 +244,12 @@ class PrioritizedReplayBuffer(object):
 
 """SolverRainbow for training and testing StarGAN and Rainbow DQN Attack."""
 class SolverRainbow(object):
-    def __init__(self, dataset_loader, config):
+    def __init__(self, dataset_loader, config, run = None):
         self.config = config # For Optuna
-
+        
+        # neptune logging
+        self.run = run 
+        
         # Parameters related to Data loader
         self.dataset_loader = dataset_loader
 
@@ -294,6 +300,11 @@ class SolverRainbow(object):
         self.action_dim = config.action_dim
         self.noise_level = config.noise_level
         self.feature_extractor_name = config.feature_extractor_name # For State
+        self.feature_extractor_frequency = config.feature_extractor_frequency # Feature extractor call frequency
+        
+        # Feature extraction caching
+        self.step_counter = 0
+        self.cached_state = None
 
         # Parameters related to PER
         self.alpha = config.alpha # PER alpha
@@ -312,6 +323,21 @@ class SolverRainbow(object):
 
         # Initialize LPIPS Metric
         self.lpips_loss = LearnedPerceptualImagePatchSimilarity(net_type='vgg').to(self.device)
+
+        # Initialize Neptune logging
+        self.run = None
+        if self.config.neptune_api_token and self.config.neptune_project:
+            try:
+                self.run = neptune.init_run(
+                    project=self.config.neptune_project,
+                    api_token=self.config.neptune_api_token,
+                    tags=["RLAB", "AttGAN", self.config.dataset, "GhostFaceNet"]
+                )
+                self.run["config"] = vars(self.config)
+                print(f"[INFO] Neptune run initialized: {self.run.get_url()}")
+            except Exception as e:
+                print(f"[WARNING] Failed to initialize Neptune: {e}")
+                self.run = None
 
         self.build_model() # Build StarGAN model
         self.build_rlab_agent() # Build RLAB Agent
@@ -360,9 +386,27 @@ class SolverRainbow(object):
         total_core_time = 0.0
         total_processing_time = 0.0
         
+        # Initialize detailed time measurement variables
+        total_generator_time = 0.0
+        total_feature_extraction_time = 0.0
+        total_feature_cached_time = 0.0
+        total_action_selection_time = 0.0
+        total_attack_execution_time = 0.0
+        total_feature_extractions = 0  # Count of actual feature extractions
+        total_feature_cache_hits = 0   # Count of cache hits
+        
         for infer_img_idx, (x_real, c_org, filename) in enumerate(data_loader):
             total_start_time = time.time()
             image_core_time = 0.0
+            
+            # Accumulators for detailed time per image
+            image_generator_time = 0.0
+            image_feature_extraction_time = 0.0
+            image_feature_cached_time = 0.0
+            image_action_selection_time = 0.0
+            image_attack_execution_time = 0.0
+            image_feature_extractions = 0
+            image_feature_cache_hits = 0
 
             x_real = x_real.to(self.device)
             c_org = c_org.to(self.device) # Move c_org to the device as well
@@ -393,30 +437,61 @@ class SolverRainbow(object):
                 c_trg[:, attr_index] = 1 - c_trg[:, attr_index]
 
                 perturbed_image = x_real.clone().detach_() + torch.tensor(np.random.uniform(-self.noise_level, self.noise_level, x_real.shape).astype('float32')).to(self.device)
+                # Reset step counter and cached state for each new image/attribute combination
+                self.step_counter = 0
+                self.cached_state = None
                 
                 for step in range(self.max_steps_per_episode):
+                    # Increment step counter for feature extraction frequency control
+                    self.step_counter += 1
                     core_start_time = time.time()
                     
+                    # Measure generator forward pass time
+                    gen_start_time = time.time()
                     with torch.no_grad():
                         original_gen_image = attgan_model.G(x_real, c_trg, mode='enc-dec')
                         perturbed_gen_image = attgan_model.G(perturbed_image, c_trg, mode='enc-dec')
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    gen_end_time = time.time()
+                    step_generator_time = gen_end_time - gen_start_time
 
-                    state = self.get_state(x_real, perturbed_image, original_gen_image, perturbed_gen_image)
+                    # Measure feature extraction time
+                    feat_start_time = time.time()
+                    state, is_cached = self.get_state(perturbed_image, perturbed_gen_image)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    feat_end_time = time.time()
+                    step_feature_time = feat_end_time - feat_start_time
                     
+                    # Measure action selection time
+                    action_start_time = time.time()
                     with torch.no_grad():
                         action = self.rl_agent.select_action(state).item()
-                        print(f"[Inference] Selected action: {action}")
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    action_end_time = time.time()
+                    step_action_time = action_end_time - action_start_time
+                    print(f"[Inference] Selected action: {action}")
                     
                     action_history.append(int(action))
                     image_indices.append(infer_img_idx)
                     attr_indices.append(idx)
                     step_indices.append(step)
                     
+                    # Measure attack execution time
+                    attack_start_time = time.time()
                     if action == 0:
                         perturbed_image, _ = self.attack_func.PGD(perturbed_image, original_gen_image, c_trg)
+                        attack_type = "PGD"
                     else:
                         freq_band = ['LOW', 'MID', 'HIGH'][action - 1]
                         perturbed_image, _ = self.attack_func.perturb_frequency_domain(perturbed_image, original_gen_image, c_trg, freq_band=freq_band)
+                        attack_type = f"Freq-{freq_band}"
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    attack_end_time = time.time()
+                    step_attack_time = attack_end_time - attack_start_time
                     
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
@@ -424,7 +499,27 @@ class SolverRainbow(object):
                     step_core_time = core_end_time - core_start_time
                     image_core_time += step_core_time
                     
+                    # Accumulate detailed times
+                    image_generator_time += step_generator_time
+                    image_action_selection_time += step_action_time
+                    image_attack_execution_time += step_attack_time
+                    
+                    if is_cached:
+                        image_feature_cached_time += step_feature_time
+                        image_feature_cache_hits += 1
+                    else:
+                        image_feature_extraction_time += step_feature_time
+                        image_feature_extractions += 1
+                    
+                    # Print existing core time
                     print(f"[Core Processing Time] Step {step + 1} processing time: {step_core_time:.5f}s")
+                    
+                    # Print detailed time breakdown
+                    cache_status = "cached" if is_cached else "extracted"
+                    print(f"  ├─ Generator forward: {step_generator_time:.5f}s")
+                    print(f"  ├─ Feature extraction: {step_feature_time:.5f}s ({cache_status})")
+                    print(f"  ├─ Action selection: {step_action_time:.5f}s")
+                    print(f"  └─ Attack execution: {step_attack_time:.5f}s ({attack_type})")
 
                 analyzed_perturbation_array = analyze_perturbation(perturbed_image - x_real)
                 total_perturbation_map += analyzed_perturbation_array
@@ -535,9 +630,30 @@ class SolverRainbow(object):
             
             total_core_time += image_core_time
             total_processing_time += total_elapsed_time
+            total_generator_time += image_generator_time
+            total_feature_extraction_time += image_feature_extraction_time
+            total_feature_cached_time += image_feature_cached_time
+            total_action_selection_time += image_action_selection_time
+            total_attack_execution_time += image_attack_execution_time
+            total_feature_extractions += image_feature_extractions
+            total_feature_cache_hits += image_feature_cache_hits
             
             print(f"[Core Processing Time] Image {infer_img_idx + 1} core processing time: {image_core_time:.5f}s")
             print(f"[Total Processing Time] Image {infer_img_idx + 1} total processing time: {total_elapsed_time:.5f}s (for reference)")
+            
+            # Print detailed time summary per image
+            print(f"\n[Detailed Time Summary] Image {infer_img_idx + 1}:")
+            print(f"  Generator forward:     {image_generator_time:.5f}s ({image_generator_time/image_core_time*100:.1f}%)")
+            print(f"  Feature extraction:    {image_feature_extraction_time:.5f}s ({image_feature_extractions} extractions)")
+            print(f"  Feature cached:        {image_feature_cached_time:.5f}s ({image_feature_cache_hits} cache hits)")
+            total_feature_time = image_feature_extraction_time + image_feature_cached_time
+            print(f"  Total feature time:    {total_feature_time:.5f}s ({total_feature_time/image_core_time*100:.1f}%)")
+            print(f"  Action selection:      {image_action_selection_time:.5f}s ({image_action_selection_time/image_core_time*100:.1f}%)")
+            print(f"  Attack execution:      {image_attack_execution_time:.5f}s ({image_attack_execution_time/image_core_time*100:.1f}%)")
+            if image_feature_extractions + image_feature_cache_hits > 0:
+                cache_hit_rate = image_feature_cache_hits / (image_feature_extractions + image_feature_cache_hits) * 100
+                print(f"  Feature cache hit rate: {cache_hit_rate:.1f}%")
+            print()
 
             if infer_img_idx >= (self.inference_image_num - 1):
                 break
@@ -545,14 +661,65 @@ class SolverRainbow(object):
         score = print_comprehensive_metrics(results, episode, total_invisible_psnr, total_invisible_ssim, total_invisible_lpips)
         visualize_actions(action_history, image_indices, attr_indices, step_indices)
 
+        # Print final time summary (existing)
+        print(f"\n{'='*80}")
         print(f"[Inference Complete] Total core processing time: {total_core_time:.5f}s")
         print(f"[Inference Complete] Total processing time (for reference): {total_processing_time:.5f}s")
-        print(f"[Inference Complete] Average core processing time: {total_core_time / episode:.5f}s (processed {episode} in total)")
-        print(f"[Inference Complete] Average total processing time (for reference): {total_processing_time / episode:.5f}s (processed {episode} in total)")
+        print(f"[Inference Complete] Average core processing time: {total_core_time / episode:.5f}s (Total {episode} processed)")
+        print(f"[Inference Complete] Average total processing time (for reference): {total_processing_time / episode:.5f}s (Total {episode} processed)")
+        
+        # Print detailed time statistics
+        print(f"\n{'='*80}")
+        print(f"[Detailed Time Statistics] Total Inference Summary")
+        print(f"{'='*80}")
+        print(f"\n1. Total Time Breakdown:")
+        print(f"   Generator forward:     {total_generator_time:.5f}s ({total_generator_time/total_core_time*100:.1f}%)")
+        print(f"   Feature extraction:    {total_feature_extraction_time:.5f}s ({total_feature_extractions} extractions)")
+        print(f"   Feature cached:        {total_feature_cached_time:.5f}s ({total_feature_cache_hits} cache hits)")
+        total_all_feature_time = total_feature_extraction_time + total_feature_cached_time
+        print(f"   Total feature time:    {total_all_feature_time:.5f}s ({total_all_feature_time/total_core_time*100:.1f}%)")
+        print(f"   Action selection:      {total_action_selection_time:.5f}s ({total_action_selection_time/total_core_time*100:.1f}%)")
+        print(f"   Attack execution:      {total_attack_execution_time:.5f}s ({total_attack_execution_time/total_core_time*100:.1f}%)")
+        
+        print(f"\n2. Average Time per Image:")
+        print(f"   Generator forward:     {total_generator_time/episode:.5f}s")
+        print(f"   Feature extraction:    {total_feature_extraction_time/episode:.5f}s")
+        print(f"   Feature cached:        {total_feature_cached_time/episode:.5f}s")
+        print(f"   Total feature time:    {total_all_feature_time/episode:.5f}s")
+        print(f"   Action selection:      {total_action_selection_time/episode:.5f}s")
+        print(f"   Attack execution:      {total_attack_execution_time/episode:.5f}s")
+        
+        print(f"\n3. Feature Extraction Statistics:")
+        print(f"   Total feature calls:   {total_feature_extractions + total_feature_cache_hits}")
+        print(f"   Actual extractions:    {total_feature_extractions}")
+        print(f"   Cache hits:            {total_feature_cache_hits}")
+        if total_feature_extractions + total_feature_cache_hits > 0:
+            overall_cache_hit_rate = total_feature_cache_hits / (total_feature_extractions + total_feature_cache_hits) * 100
+            print(f"   Cache hit rate:        {overall_cache_hit_rate:.1f}%")
+            if total_feature_extractions > 0:
+                avg_extraction_time = total_feature_extraction_time / total_feature_extractions
+                print(f"   Avg extraction time:   {avg_extraction_time:.5f}s")
+            if total_feature_cache_hits > 0:
+                avg_cached_time = total_feature_cached_time / total_feature_cache_hits
+                print(f"   Avg cached time:       {avg_cached_time:.5f}s")
+                if total_feature_extractions > 0:
+                    speedup = avg_extraction_time / avg_cached_time
+                    print(f"   Cache speedup:         {speedup:.2f}x")
+        
+        print(f"\n4. Configuration:")
+        print(f"   Feature extractor:     {self.feature_extractor_name}")
+        print(f"   Extractor frequency:   {self.feature_extractor_frequency}")
+        print(f"   Max steps per episode: {self.max_steps_per_episode}")
+        print(f"   Number of images:      {episode}")
+        print(f"{'='*80}\n")
 
         return score
 
     def load_rainbow_dqn_checkpoint(self, checkpoint_path):
+        if not os.path.exists(checkpoint_path):
+            print(f"[INFO] Checkpoint not found at {checkpoint_path}. Starting from scratch.")
+            return
+            
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.rl_agent.dqn.load_state_dict(checkpoint['rainbow_dqn_state_dict'])
         self.rl_agent.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -580,13 +747,22 @@ class SolverRainbow(object):
             extractor = resnet50(weights=ResNet50_Weights.DEFAULT)
             self.feature_extractor = nn.Sequential(*list(extractor.children())[:-2]).to(device).eval()
         elif self.feature_extractor_name == "mesonet":
-            meso4_model = Meso4()
-            convert_tf_weights_to_pytorch("./weights/Meso4_DF.h5", meso4_model, 'meso4')
-            self.meso4_extractor = meso4_model.to(device).eval()
-
-            meso_inception4_model = MesoInception4()
-            convert_tf_weights_to_pytorch("./weights/MesoInception_DF.h5", meso_inception4_model, 'mesoinception4')
-            self.meso4_inception_extractor = meso_inception4_model.to(device).eval()
+            # MesoNet is replaced by GhostFaceNet
+            raise ValueError("MesoNet is deprecated. Use 'ghostfacenets' instead.")
+        elif self.feature_extractor_name == "ghostfacenets":
+            # GhostFaceNetsV2 모델을 임베딩 추출 모드로 불러옵니다.
+            # 입력 이미지 크기는 256x256이며, width=1, dropout=0.으로 설정합니다.
+            model = GhostFaceNetsV2(image_size=256, width=1, dropout=0.)
+            self.feature_extractor = model.to(device).eval()
+        elif self.feature_extractor_name == "edgeface":
+            # EdgeFace 모델을 torch.hub에서 불러옵니다.
+            self.feature_extractor = torch.hub.load(
+                'otroshi/edgeface', 
+                'edgeface_xs_gamma_06',
+                source='github', 
+                pretrained=True,
+                trust_repo="check"
+            ).to(device).eval()
         else:
             raise ValueError("Invalid FEATURE_EXTRACTOR_NAME")
 
@@ -598,13 +774,18 @@ class SolverRainbow(object):
 
         # Configure Rainbow DQN Agent
         if (self.feature_extractor_name == "vgg19"):
-            state_dim = 131072
+            state_dim = 65536
         elif (self.feature_extractor_name == "resnet50"):
-            state_dim = 524288
+            state_dim = 262144
         elif (self.feature_extractor_name == "mesonet"):
-            state_dim = 128
+            state_dim = 64
+        elif (self.feature_extractor_name == "ghostfacenets"):
+            state_dim = 1024 # 512 * 2 images
+        elif (self.feature_extractor_name == "edgeface"):
+            state_dim = 1024 # 512 * 2 images
         else:
-            state_dim = 128
+            # default: ghostfacenets or edgeface = 512 * 2
+            state_dim = 1024
 
         # Variable to be used in select_action()
         initial_ratio_steps = self.max_steps_per_episode * self.training_image_num * 5 // 10
@@ -617,14 +798,75 @@ class SolverRainbow(object):
         self.rl_agent.dqn.to(self.device) # policy_net -> dqn
         self.rl_agent.dqn_target.to(self.device) # target_net -> dqn_target
 
+    def restore_attgan_model(self, checkpoint_path):
+        """Load AttGAN model from a specific checkpoint path"""
+        if not os.path.exists(checkpoint_path):
+            print(f"[WARNING] AttGAN checkpoint not found: {checkpoint_path}")
+            print(f"[INFO] Using randomly initialized weights.")
+            return
+        
+        print(f"[INFO] Loading AttGAN checkpoint from: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
+        
+        if isinstance(checkpoint, dict) and 'G' in checkpoint:
+            # AttGAN format: {'G': state_dict, 'D': state_dict (optional)}
+            self.G.load_state_dict(checkpoint['G'], strict=False)
+            print(f"[INFO] Successfully loaded Generator from AttGAN checkpoint")
+            
+            if 'D' in checkpoint:
+                self.D.load_state_dict(checkpoint['D'], strict=False)
+                print(f"[INFO] Successfully loaded Discriminator from AttGAN checkpoint")
+            else:
+                print(f"[INFO] Discriminator not found in checkpoint, using randomly initialized weights")
+        else:
+            print(f"[WARNING] Unexpected checkpoint format in {checkpoint_path}")
+            print(f"[INFO] Using randomly initialized weights.")
+    
     def restore_model(self, resume_iters):
         """Reset the weights of the trained generator and discriminator"""
         print('Loading the trained models from step {}...'.format(resume_iters))
+        
+        # Try multiple checkpoint formats
+        # Format 1: Original AttGAN format (weights.{iter}.pth with 'G' key)
+        attgan_pth_path = os.path.join(self.model_save_dir, 'weights.{}.pth'.format(resume_iters))
+        # Format 2: Separate .ckpt files
         G_path = os.path.join(self.model_save_dir, '{}-G.ckpt'.format(resume_iters))
         D_path = os.path.join(self.model_save_dir, '{}-D.ckpt'.format(resume_iters))
 
+        # Try loading AttGAN .pth format first
+        if os.path.exists(attgan_pth_path):
+            print(f"[INFO] Loading AttGAN checkpoint from: {attgan_pth_path}")
+            checkpoint = torch.load(attgan_pth_path, map_location=lambda storage, loc: storage)
+            
+            if isinstance(checkpoint, dict) and 'G' in checkpoint:
+                # AttGAN format: {'G': state_dict, 'D': state_dict (optional)}
+                self.G.load_state_dict(checkpoint['G'], strict=False)
+                print(f"[INFO] Successfully loaded Generator from AttGAN checkpoint")
+                
+                if 'D' in checkpoint:
+                    self.D.load_state_dict(checkpoint['D'], strict=False)
+                    print(f"[INFO] Successfully loaded Discriminator from AttGAN checkpoint")
+                else:
+                    print(f"[INFO] Discriminator not found in checkpoint, using randomly initialized weights")
+                return
+            else:
+                print(f"[WARNING] Unexpected checkpoint format in {attgan_pth_path}")
+        
+        # Fall back to separate .ckpt files
+        if not os.path.exists(G_path):
+            print(f"[WARNING] Generator checkpoint not found: {G_path}")
+            print(f"[INFO] Skipping model loading. Using randomly initialized weights.")
+            return
+        
+        if not os.path.exists(D_path):
+            print(f"[WARNING] Discriminator checkpoint not found: {D_path}")
+            print(f"[INFO] Loading only Generator weights.")
+            self.load_model_weights(self.G, G_path)
+            return
+
         self.load_model_weights(self.G, G_path)
         self.D.load_state_dict(torch.load(D_path, map_location=lambda storage, loc: storage))
+        print(f"[INFO] Successfully loaded Generator and Discriminator from step {resume_iters}")
 
     def load_model_weights(self, model, path):
         pretrained_dict = torch.load(path, map_location=lambda storage, loc: storage)
@@ -678,51 +920,102 @@ class SolverRainbow(object):
             c_trg_list.append(c_trg.to(self.device))
         return c_trg_list
 
-    """
-        Calculates the reward.
-        LPIPS: A value between [0, 1]. The lower the value, the more similar the two images are. 
-               Generally, an LPIPS value greater than 0.5 is considered to indicate a human-observable difference between two images.
-    """
+    # """
+    #     Calculates the reward.
+    #     LPIPS: A value between [0, 1]. The lower the value, the more similar the two images are. 
+    #            Generally, an LPIPS value greater than 0.5 is considered to indicate a human-observable difference between two images.
+    # """
+    # def calculate_reward(self, original_gen_image, perturbed_gen_image, x_real, perturbed_image, c_trg):
+    #     # 1. Deepfake Defense Reward
+    #     # Use the difference between StarGAN generated images (L1, L2, LPIPS) as a reward.
+    #     # Randomly apply "image transformations" to original_gen_image and perturbed_gen_image each time, and calculate the difference between them.
+    #     transformed_x_real, transformed_perturbed_image = apply_random_transform(x_real, perturbed_image)
+    #     transformed_original = attgan_model.G(transformed_x_real, c_trg, mode='enc-dec')
+    #     transformed_perturbed = attgan_model.G(transformed_perturbed_image, c_trg, mode='enc-dec')
+
+
+    #     defense_l1_loss = F.l1_loss(transformed_original, transformed_perturbed)
+    #     defense_l2_loss = F.mse_loss(transformed_original, transformed_perturbed)
+
+    #     defense_lpips = self.lpips_loss(transformed_original, transformed_perturbed).mean()
+
+    #     # Scale and apply based on L1 Error = [0, 131,072] / L2 Error = [0, 512] / LPIPS = [0, 1]
+    #     reward_defense = ((defense_l1_loss / 10) + (defense_l2_loss / 5) + defense_lpips) * 5
+
+    #     # 2. Noise Invisibility Reward
+    #     # Use the similarity between the noisy image and the original image as a reward (PSNR, SSIM, LPIPS).
+    #     x_real_np = x_real.squeeze().cpu().numpy()
+    #     perturbed_image_np = perturbed_image.squeeze().cpu().numpy()
+
+    #     if np.array_equal(x_real_np, perturbed_image_np):
+    #         invisibility_psnr = 100.0 # Assign max PSNR if the two images are identical
+    #     else:
+    #         invisibility_psnr = psnr(x_real.squeeze().cpu().numpy(), perturbed_image.squeeze().cpu().numpy(), data_range=1.0)
+
+    #     invisibility_ssim = ssim(x_real.squeeze().cpu().numpy(), perturbed_image.squeeze().cpu().numpy(), data_range=1.0, win_size=3, channel_axis=0, multichannel=True) # Specify channel axis
+
+    #     invisibility_lpips = self.lpips_loss(perturbed_image, x_real).mean()
+
+    #     # Scale and apply based on PSNR = [0, 100] / SSIM = [-1, 1] / LPIPS = [0, 1]
+    #     reward_invisibility = (0.01 * invisibility_psnr) + invisibility_ssim + (1 - invisibility_lpips)
+
+    #     # Final Reward Combination (Since the two rewards are in a trade-off relationship, adjust weights while keeping the sum fixed at 1.0)
+    #     w_defense = self.reward_weight
+    #     w_invisibility = 1.0 - w_defense
+    #     total_reward = w_defense * reward_defense + w_invisibility * reward_invisibility
+
+    #     return total_reward, defense_l1_loss, defense_l2_loss, defense_lpips, invisibility_ssim, invisibility_psnr, invisibility_lpips
+
+
     def calculate_reward(self, original_gen_image, perturbed_gen_image, x_real, perturbed_image, c_trg):
-        # 1. Deepfake Defense Reward
-        # Use the difference between StarGAN generated images (L1, L2, LPIPS) as a reward.
+        ### a. Effectiveness
         # Randomly apply "image transformations" to original_gen_image and perturbed_gen_image each time, and calculate the difference between them.
         transformed_x_real, transformed_perturbed_image = apply_random_transform(x_real, perturbed_image)
-        transformed_original = attgan_model.G(transformed_x_real, c_trg, mode='enc-dec')
-        transformed_perturbed = attgan_model.G(transformed_perturbed_image, c_trg, mode='enc-dec')
-
-
+        transformed_original, _ = self.G(transformed_x_real, c_trg)
+        transformed_perturbed, _ = self.G(transformed_perturbed_image, c_trg)
         defense_l1_loss = F.l1_loss(transformed_original, transformed_perturbed)
         defense_l2_loss = F.mse_loss(transformed_original, transformed_perturbed)
-
         defense_lpips = self.lpips_loss(transformed_original, transformed_perturbed).mean()
 
-        # Scale and apply based on L1 Error = [0, 131,072] / L2 Error = [0, 512] / LPIPS = [0, 1]
-        reward_defense = ((defense_l1_loss / 10) + (defense_l2_loss / 5) + defense_lpips) * 5
-
-        # 2. Noise Invisibility Reward
+        ### b. Imperceptibility
         # Use the similarity between the noisy image and the original image as a reward (PSNR, SSIM, LPIPS).
         x_real_np = x_real.squeeze().cpu().numpy()
         perturbed_image_np = perturbed_image.squeeze().cpu().numpy()
-
         if np.array_equal(x_real_np, perturbed_image_np):
-            invisibility_psnr = 100.0 # Assign max PSNR if the two images are identical
+            invisibility_psnr = 100.0 # If the two images are identical, assign the maximum PSNR value.
         else:
             invisibility_psnr = psnr(x_real.squeeze().cpu().numpy(), perturbed_image.squeeze().cpu().numpy(), data_range=1.0)
-
-        invisibility_ssim = ssim(x_real.squeeze().cpu().numpy(), perturbed_image.squeeze().cpu().numpy(), data_range=1.0, win_size=3, channel_axis=0, multichannel=True) # Specify channel axis
-
+        invisibility_ssim = ssim(x_real.squeeze().cpu().numpy(), perturbed_image.squeeze().cpu().numpy(), data_range=1.0, win_size=3, channel_axis=0, multichannel=True) # Specify channel axis.
         invisibility_lpips = self.lpips_loss(perturbed_image, x_real).mean()
+ 
+        # parameter setting
+        tau_eff = 0.05   # effectiveness threshold
+        tau_ssim, m_ssim = 0.96, 0.02   # SSIM margin
+        m_eff = 0.03                    # L2 margin 
+        lam = 0.7                       # SSIM penalty
+        eta = 0.6                       # effectiveness weight (0~1)
 
-        # Scale and apply based on PSNR = [0, 100] / SSIM = [-1, 1] / LPIPS = [0, 1]
-        reward_invisibility = (0.01 * invisibility_psnr) + invisibility_ssim + (1 - invisibility_lpips)
+        def clip01(x): 
+            return max(0.0, min(1.0, x))
 
-        # Final Reward Combination (Since the two rewards are in a trade-off relationship, adjust weights while keeping the sum fixed at 1.0)
-        w_defense = self.reward_weight
-        w_invisibility = 1.0 - w_defense
-        total_reward = w_defense * reward_defense + w_invisibility * reward_invisibility
+        # 1) effectiveness hinge (0→1 saturate)
+        g_l2   = clip01((float(defense_l2_loss) - float(tau_eff)) / m_eff)
 
+        # 2) imperceptibility hinge (0→1 saturate)
+        g_ssim = clip01((float(invisibility_ssim) - tau_ssim) / m_ssim)
+
+        # 3) SSIM penalty (0→1 saturate)
+        pen_ssim = clip01((tau_ssim - float(invisibility_ssim)) / m_ssim)
+
+        # effectiveness more weighting
+        base = g_l2 * (eta + (1.0 - eta) * g_ssim)
+        total_reward = base - lam * pen_ssim
+        # total_reward = max(-1.0, min(1.0, total_reward))  # optionally clip the reward to [-1, 1]
+        
+        print(f"[total Reward] L2={defense_l2_loss:.4f}, lpips={invisibility_lpips:.4f}, ssim={invisibility_ssim}, total_reward={total_reward}")
         return total_reward, defense_l1_loss, defense_l2_loss, defense_lpips, invisibility_ssim, invisibility_psnr, invisibility_lpips
+
+
 
 
     """
@@ -739,64 +1032,58 @@ class SolverRainbow(object):
         
         1. Using VGG-19 model
         Output dimension: 256x256 input image -> [1, 512, 8, 8] feature map -> [1, 32768] flattened
-        Final output when combining 4 images: [1, 131072]
+        Final output when combining 2 images: [1, 65536]
 
         2. Using ResNet50 model
         Output dimension: 256x256 input image -> [1, 2048, 8, 8] feature map -> [1, 131072] flattened
-        Final output when combining 4 images: [1, 524288]
+        Final output when combining 2 images: [1, 262144]
 
         3. Using MesoNet model
-        Final output when combining 4 images: [1, 128]
+        Final output when combining 2 images: [1, 64]
+
+        4. Using GhostFaceNets model
+        Output dimension: 256x256 input image -> [1, 512] embedding vector
+        Final output when combining 2 images: [1, 1024]
     """
-    def get_state(self, x_real, perturbed_image, original_gen_image, perturbed_gen_image):
-        # # Convert input image range from [-1, 1] to [0, 1]
-        # x_real_norm = (x_real + 1) / 2
-        # perturbed_image_norm = (perturbed_image + 1) / 2
-        # original_gen_image_norm = (original_gen_image + 1) / 2
-        # perturbed_gen_image_norm = (perturbed_gen_image + 1) / 2
+    def get_state(self, perturbed_image, perturbed_gen_image, force_extract=False):
+        # Check if we should extract features based on frequency
+        should_extract = force_extract or (self.step_counter % self.feature_extractor_frequency == 0)
         
-        # # Normalize with ImageNet mean and standard deviation
-        # normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], 
-        #                                 std=[0.229, 0.224, 0.225])
-        # x_real_norm = normalize(x_real_norm)
-        # perturbed_image_norm = normalize(perturbed_image_norm)
-        # original_gen_image_norm = normalize(original_gen_image_norm)
-        # perturbed_gen_image_norm = normalize(perturbed_gen_image_norm)
+        # If we don't need to extract and have cached state, return cached
+        if not should_extract and self.cached_state is not None:
+            return self.cached_state, True  # Return (state, is_cached=True)
+        
+        # Otherwise, extract features and cache them
+        # Convert input image range from [-1, 1] to [0, 1]
+        perturbed_image_norm = (perturbed_image + 1) / 2
+        perturbed_gen_image_norm = (perturbed_gen_image + 1) / 2
+        
+        # Normalize with ImageNet mean and standard deviation
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                        std=[0.229, 0.224, 0.225])
+        perturbed_image_norm = normalize(perturbed_image_norm)
+        perturbed_gen_image_norm = normalize(perturbed_gen_image_norm)
 
-        # # Extract features from images
-        # with torch.no_grad():
-        #     real_features = self.feature_extractor(x_real_norm)
-        #     perturbed_features = self.feature_extractor(perturbed_image_norm)
-        #     original_gen_features = self.feature_extractor(original_gen_image_norm)
-        #     perturbed_gen_features = self.feature_extractor(perturbed_gen_image_norm)
-        
-        # # Flatten feature vectors
-        # real_features = real_features.view(real_features.size(0), -1)
-        # perturbed_features = perturbed_features.view(perturbed_features.size(0), -1)
-        # original_gen_features = original_gen_features.view(original_gen_features.size(0), -1)
-        # perturbed_gen_features = perturbed_gen_features.view(perturbed_gen_features.size(0), -1)
-        
-        # # Concatenate feature vectors
-        # combined_features = torch.cat([real_features, perturbed_features, original_gen_features, perturbed_gen_features], dim=1)
-        
-        # return combined_features
-
-        # Use Meso4 + Meso4Inception
+        # Extract features from images
         with torch.no_grad():
-            meso4_features_real = self.meso4_extractor.extract_features(x_real)
-            meso4_features_perturbed = self.meso4_extractor.extract_features(perturbed_image)
-            meso4_features_original_gen = self.meso4_extractor.extract_features(original_gen_image)
-            meso4_features_perturbed_gen = self.meso4_extractor.extract_features(perturbed_gen_image)
+            perturbed_features = self.feature_extractor(perturbed_image_norm)
+            perturbed_gen_features = self.feature_extractor(perturbed_gen_image_norm)
+        
+        # Flatten the features if they are not already 1D (e.g., from VGG/ResNet)
+        if perturbed_features.dim() > 2:
+            perturbed_features = perturbed_features.view(perturbed_features.size(0), -1)
+            perturbed_gen_features = perturbed_gen_features.view(perturbed_gen_features.size(0), -1)
 
-            meso4_inception_features_real = self.meso4_inception_extractor.extract_features(x_real)
-            meso4_inception_features_perturbed = self.meso4_inception_extractor.extract_features(perturbed_image)
-            meso4_inception_features_original_gen = self.meso4_inception_extractor.extract_features(original_gen_image)
-            meso4_inception_features_perturbed_gen = self.meso4_inception_extractor.extract_features(perturbed_gen_image)
+        # Concatenate the features to form the state vector
+        state = torch.cat((perturbed_features, perturbed_gen_features), dim=1)
+        
+        # Cache the extracted features
+        self.cached_state = state
+        
+        return state, False  # Return (state, is_cached=False)
 
-        # Combine all features (total 128 dimensions)
-        combined_features = torch.cat([meso4_features_real, meso4_features_perturbed, meso4_features_original_gen, meso4_features_perturbed_gen, meso4_inception_features_real, meso4_inception_features_perturbed, meso4_inception_features_original_gen, meso4_inception_features_perturbed_gen], dim=1)
 
-        return combined_features
+
 
     """Performs the RLAB attack (Rainbow DQN Agent)"""
     def train_attack(self):
@@ -920,7 +1207,7 @@ class SolverRainbow(object):
                     frame_idx += 1 # Increment frame_idx (for PER beta annealing)
 
                     # 1. Calculate State
-                    state = self.get_state(x_real, perturbed_image, original_gen_image, perturbed_gen_image)
+                    state, _ = self.get_state(perturbed_image, perturbed_gen_image)  # Ignore cache status in training
 
                     # 2. Select Action (Rainbow DQN Agent)
                     action = self.rl_agent.select_action(state) # NoisyNet does not use Epsilon-greedy
@@ -961,7 +1248,20 @@ class SolverRainbow(object):
                     # 5. Calculate Reward
                     reward, defense_l1_loss, defense_l2_loss, defense_lpips, invisibility_ssim, invisibility_psnr, invisibility_lpips = self.calculate_reward(original_gen_image, perturbed_gen_image, x_real, perturbed_image, c_trg)
 
-                    total_reward_this_episode += reward.item() # To get the reward trend plot
+                    # neptune logging
+                    if self.run is not None:
+                        self.run["train/reward"].append(float(reward))
+                        self.run["train/L1"].append(float(defense_l1_loss))
+                        self.run["train/L2"].append(float(defense_l2_loss))
+                        self.run["train/LPIPS"].append(float(invisibility_lpips))
+                        self.run["train/SSIM"].append(float(invisibility_ssim))
+
+                    # To get the reward trend plot
+                    if isinstance(reward, torch.Tensor):
+                        total_reward_this_episode += reward.item()
+                    else:
+                        total_reward_this_episode += reward      
+
 
                     reward_tensor = torch.tensor([reward], dtype=torch.float32).to(self.device) # Convert reward to a tensor
 
@@ -971,7 +1271,7 @@ class SolverRainbow(object):
 
 
                     # 6. Calculate Next State (same as current state, or the state of the next step)
-                    next_state = self.get_state(x_real, perturbed_image, original_gen_image, perturbed_gen_image)
+                    next_state, _ = self.get_state(perturbed_image, perturbed_gen_image)  # Ignore cache status in training
 
 
                     # N-step buffer for test_attack episode
@@ -1171,8 +1471,9 @@ class SolverRainbow(object):
         except Exception as e:
             print(f"[!] Error occurred while saving Rainbow DQN agent weights and optimizer weights: {e}")
         print(f"[INFO] Finished saving Rainbow DQN agent weights and optimizer weights: {checkpoint_path}")
-
-
+        if self.run is not None:
+            self.run.stop()
+    
     """Helper function to create an N-step transition"""
     def _get_n_step_transition(self, n_step_buffer):
         state, action = n_step_buffer[0][:2] # Start State, Action
