@@ -8,12 +8,27 @@ from torch.backends import cudnn
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['TORCH_USE_CUDA_DSA'] = '1'
 
+#attgan+maad infer 실행명령어
+"""
+python attgan_main.py --mode inference --dataset MAADFace     --inference_image_num 100     --max_steps_per_episode 18     --image_size 256     --c_dim 5     --selected_attrs Black_Hair Blond_Hair Brown_Hair Male Young     --images_dir /scratch/x3092a02/stargan2/MAAD-Face/data/
+train     --attr_path /scratch/x3092a02/stargan2/MAAD-Face/MAAD_Face_filtered.csv     --model_save_dir attgan_celeba_256/models     --result_dir result_inference_attgan_maadface
+_freq3_step18_100     --test_iters 200000     --batch_size 1     --feature_extractor_name edgeface     --feature_extractor_frequency 3
+"""
+
+#attgan+celeba infer 실행명령어
+"""
+python attgan_main.py --mode inference --dataset CelebA     --inference_image_num 100     --max_steps_per_episode 18     --image_size 256     --c_dim 5     --selected_attrs Black_Hair Blond_Hair Brown_Hair Male Young     --images_dir data/celeba/images     --attr_path data/cele
+ba/list_attr_celeba.txt     --model_save_dir attgan_celeba_256/models     --result_dir result_inference_attgan_celeba_baseline100     --test_iters 200000     --batch_size 1     --feature_extractor_name edgeface     --feature_extractor_frequency 3     --start_index 20
+"""
 def str2bool(v):
     return v.lower() in ('true')
 
 def main(config):
     # For fast training
     cudnn.benchmark = True
+
+    # neptune logging is handled inside SolverRainbow class
+    run = None
 
     # Create directories if not exist
     if not os.path.exists(config.log_dir):
@@ -46,8 +61,10 @@ def main(config):
         # checkpoint_path = os.path.join(config.model_save_dir, f'rainbow_dqn_final_{config.test_iters}.pth')
         checkpoint_path = os.path.join(config.model_save_dir, f'final_rainbow_dqn.pth') # rainbow_dqn_agent.ckpt
         solver.load_rainbow_dqn_checkpoint(checkpoint_path)
-        # Load StarGAN model (required)
-        solver.restore_model(config.test_iters)
+        # Load AttGAN model (required)
+        # Use fixed AttGAN checkpoint path instead of test_iters
+        attgan_checkpoint_path = '/scratch/x3092a02/stargan2/attgan/256_shortcut1_inject1_none_hq/checkpoint/weights.199.pth'
+        solver.restore_attgan_model(attgan_checkpoint_path)
         # Perform inference
         solver.inference_rainbow_dqn(dataset_loader, result_dir=config.result_dir)
 
@@ -114,7 +131,12 @@ if __name__ == '__main__':
     parser.add_argument('--max_steps_per_episode', type=int, default=20, help='max steps per episode')
     parser.add_argument('--action_dim', type=int, default=4, help='max action dimension')
     parser.add_argument('--noise_level', type=float, default=0.005, help='noise level for RLAB perturbation')
-    parser.add_argument('--feature_extractor_name', type=str, default="mesonet", help='Image feature extraction for State (mesonet, resnet50, vgg19)')
+    parser.add_argument('--feature_extractor_name', type=str, default="ghostfacenets", help='Image feature extraction for State (mesonet, resnet50, vgg19, ghostfacenets)')
+    parser.add_argument('--feature_extractor_frequency', type=int, default=1, help='Feature extractor call frequency (1=every step, 2=every 2 steps, etc.)')
+    
+    # Neptune Logging Configuration
+    parser.add_argument('--neptune_api_token', type=str, default=None, help='Neptune.ai API token for logging')
+    parser.add_argument('--neptune_project', type=str, default=None, help='Neptune.ai project name (e.g., "rudwls281689/deepfake")')
 
 
     parser.add_argument('--alpha', type=float, default=0.8, help='PER alpha parameter')
