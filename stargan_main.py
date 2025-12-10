@@ -8,13 +8,13 @@ from stargan_data_loader import get_loader
 
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['TORCH_USE_CUDA_DSA'] = '1'
-#celeba
+#stargan+celeba infer
 """
 python stargan_main.py --mode inference --dataset CelebA     --inference_image_num 100     --max_steps_per_episode 18     --image_size 256     --c_dim 5     --selected_attrs Black_Hair Blond_Hair Brown_Hair Male Young     --images_dir data/celeba/images     --attr_path data/cele
 ba/list_attr_celeba.txt     --model_save_dir=stargan_celeba_256/models          --test_iters 200000     --batch_size 1     --feature_extractor_name edgeface     --feature_extractor_frequency 3     --start_index 20
 """
 
-#maad
+#stargan+maad infer
 '''
 python "stargan_main.py" --mode inference --dataset MAADFace --inference_image_num 100 --image_size 256 --c_dim 5 --selected_attrs Black_Hair Blond_Hair Brown_Hair Male Young --images_dir=/scratch/x3092a02/stargan2/MAAD-Face/data/train --attr_path=/scratch/x3092a02/stargan2/MAAD-Face/MAAD_Face_filtered.csv --model_save_dir=stargan_celeba_256/models --result_dir=result_inference_MAAD_detailed --test_iters 200000 --batch_size 1 --feature_extractor_name edgeface --feature_extractor_frequency 3 --max_steps_per_episode 18
 '''
