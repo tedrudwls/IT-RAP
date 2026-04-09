@@ -83,6 +83,10 @@ def main(config):
                     dataset_loader, result_dir=config.result_dir,
                     calib_loader=calib_loader, calib_image_num=config.calib_image_num)
 
+            elif config.action_policy == 'roundrobin':
+                print("[INFO] Running Round-Robin Policy baseline inference...")
+                solver.inference_roundrobin_policy(dataset_loader, result_dir=config.result_dir)
+
             else:  # 'rl' (default)
                 checkpoint_path = os.path.join(config.model_save_dir, f'final_rainbow_dqn.pth')
                 solver.load_rainbow_dqn_checkpoint(checkpoint_path)
@@ -194,9 +198,10 @@ if __name__ == '__main__':
 
     # ---- Baseline action policy arguments ----
     parser.add_argument('--action_policy', type=str, default='rl',
-                        choices=['rl', 'random', 'greedy'],
+                        choices=['rl', 'random', 'greedy', 'roundrobin'],
                         help='Action selection policy: rl (default, uses trained Rainbow DQN), '
-                             'random (uniform random), greedy (calibration-based greedy)')
+                             'random (uniform random), greedy (calibration-based greedy), '
+                             'roundrobin (deterministic cycling: step %% 4)')
     parser.add_argument('--calib_image_num', type=int, default=50,
                         help='Number of calibration images for greedy policy baseline')
 

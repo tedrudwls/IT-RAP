@@ -1169,6 +1169,183 @@ class SolverRainbow(object):
         return score
 
 
+    # =========================================================================
+    # Baseline: Round-Robin Policy
+    # At each step t, action = t % 4  (0->PGD, 1->Freq-LOW, 2->Freq-MID, 3->Freq-HIGH)
+    # No learning, no calibration. Purely deterministic cycling.
+    # =========================================================================
+    def inference_roundrobin_policy(self, data_loader, result_dir):
+        """Inference using round-robin action selection (baseline for RL ablation).
+
+        At step t, action = t % 4:
+          0 -> PGD
+          1 -> Freq-LOW
+          2 -> Freq-MID
+          3 -> Freq-HIGH
+        """
+        os.makedirs(result_dir, exist_ok=True)
+        self.attack_func = stargan_attacks.AttackFunction(config=self.config, model=self.G, device=self.device)
+
+        results = {
+            "원본(변형없음)": {"l1_error": 0.0, "l2_error": 0.0, "defense_psnr": 0.0,
+                        "defense_ssim": 0.0, "defense_lpips": 0.0, "attack_success": 0, "total_remain_map": np.zeros((256, 256))},
+            "JPEG압축": {"l1_error": 0.0, "l2_error": 0.0, "defense_psnr": 0.0,
+                    "defense_ssim": 0.0, "defense_lpips": 0.0, "attack_success": 0, "total_remain_map": np.zeros((256, 256))},
+            "OpenCV디노이즈": {"l1_error": 0.0, "l2_error": 0.0, "defense_psnr": 0.0,
+                        "defense_ssim": 0.0, "defense_lpips": 0.0, "attack_success": 0, "total_remain_map": np.zeros((256, 256))},
+            "중간값스무딩": {"l1_error": 0.0, "l2_error": 0.0, "defense_psnr": 0.0,
+                        "defense_ssim": 0.0, "defense_lpips": 0.0, "attack_success": 0, "total_remain_map": np.zeros((256, 256))},
+            "크기조정패딩": {"l1_error": 0.0, "l2_error": 0.0, "defense_psnr": 0.0,
+                    "defense_ssim": 0.0, "defense_lpips": 0.0, "attack_success": 0, "total_remain_map": np.zeros((256, 256))},
+            "이미지변환": {"l1_error": 0.0, "l2_error": 0.0, "defense_psnr": 0.0,
+                    "defense_ssim": 0.0, "defense_lpips": 0.0, "attack_success": 0, "total_remain_map": np.zeros((256, 256))}
+        }
+        total_invisible_psnr, total_invisible_ssim, total_invisible_lpips = 0.0, 0.0, 0.0
+        episode = 0
+        action_history = []
+        image_indices = []
+        attr_indices = []
+        step_indices = []
+
+        for infer_img_idx, (x_real, c_org, filename) in enumerate(data_loader):
+            x_real = x_real.to(self.device)
+            noattack_result_list = [x_real]
+            jpeg_result_list = [x_real]
+            opencv_result_list = [x_real]
+            median_result_list = [x_real]
+            padding_result_list = [x_real]
+            transforms_result_list = [x_real]
+
+            c_trg_list = self.create_labels(c_org, self.c_dim, self.dataset, self.selected_attrs)
+            for idx, c_trg in enumerate(c_trg_list):
+                c_trg = c_trg.to(self.device)
+                perturbed_image = x_real.clone().detach_() + torch.tensor(
+                    np.random.uniform(-0.01, 0.01, x_real.shape).astype('float32')).to(self.device)
+
+                for step in range(self.max_steps_per_episode):
+                    with torch.no_grad():
+                        original_gen_image, _ = self.G(x_real, c_trg)
+                        perturbed_gen_image, _ = self.G(perturbed_image, c_trg)
+
+                    # ---- Round-Robin action selection: action = step % 4 ----
+                    action = step % 4
+                    print(f"[RoundRobin Policy] Step {step+1}: action={action}")
+
+                    action_history.append(action)
+                    image_indices.append(infer_img_idx)
+                    attr_indices.append(idx)
+                    step_indices.append(step)
+
+                    if action == 0:
+                        perturbed_image, _ = self.attack_func.PGD(perturbed_image, original_gen_image, c_trg)
+                    else:
+                        freq_band = ['LOW', 'MID', 'HIGH'][action - 1]
+                        perturbed_image, _ = self.attack_func.perturb_frequency_domain(
+                            perturbed_image, original_gen_image, c_trg, freq_band=freq_band)
+
+                analyzed_perturbation_array = analyze_perturbation(perturbed_image - x_real)
+
+                with torch.no_grad():
+                    remain_perturb_array = analyze_perturbation(perturbed_image - x_real)
+                    results["원본(변형없음)"]["total_remain_map"] += remain_perturb_array
+                    original_gen_image, _ = self.G(x_real, c_trg)
+                    perturbed_gen_image_orig, _ = self.G(perturbed_image, c_trg)
+                    noattack_result_list.append(perturbed_image)
+                    noattack_result_list.append(original_gen_image)
+                    noattack_result_list.append(perturbed_gen_image_orig)
+                    results = calculate_and_save_metrics(original_gen_image, perturbed_gen_image_orig, "원본(변형없음)", results)
+
+                x_adv_jpeg = compress_jpeg(perturbed_image, quality=75)
+                with torch.no_grad():
+                    remain_perturb_array = analyze_perturbation(x_adv_jpeg - x_real)
+                    results["JPEG압축"]["total_remain_map"] += remain_perturb_array
+                    perturbed_gen_image_jpeg, _ = self.G(x_adv_jpeg, c_trg)
+                    jpeg_result_list.append(x_adv_jpeg)
+                    jpeg_result_list.append(original_gen_image)
+                    jpeg_result_list.append(perturbed_gen_image_jpeg)
+                    results = calculate_and_save_metrics(original_gen_image, perturbed_gen_image_jpeg, "JPEG압축", results)
+
+                x_adv_denoise_opencv = denoise_opencv(perturbed_image)
+                with torch.no_grad():
+                    remain_perturb_array = analyze_perturbation(x_adv_denoise_opencv - x_real)
+                    results["OpenCV디노이즈"]["total_remain_map"] += remain_perturb_array
+                    perturbed_gen_image_opencv, _ = self.G(x_adv_denoise_opencv, c_trg)
+                    opencv_result_list.append(x_adv_denoise_opencv)
+                    opencv_result_list.append(original_gen_image)
+                    opencv_result_list.append(perturbed_gen_image_opencv)
+                    results = calculate_and_save_metrics(original_gen_image, perturbed_gen_image_opencv, "OpenCV디노이즈", results)
+
+                x_adv_median = denoise_scikit(perturbed_image)
+                with torch.no_grad():
+                    remain_perturb_array = analyze_perturbation(x_adv_median - x_real)
+                    results["중간값스무딩"]["total_remain_map"] += remain_perturb_array
+                    perturbed_gen_image_median, _ = self.G(x_adv_median, c_trg)
+                    median_result_list.append(x_adv_median)
+                    median_result_list.append(original_gen_image)
+                    median_result_list.append(perturbed_gen_image_median)
+                    results = calculate_and_save_metrics(original_gen_image, perturbed_gen_image_median, "중간값스무딩", results)
+
+                x_real_padding, x_adv_padding = random_resize_padding(x_real, perturbed_image)
+                with torch.no_grad():
+                    remain_perturb_array = analyze_perturbation(x_adv_padding - x_real_padding)
+                    results["크기조정패딩"]["total_remain_map"] += remain_perturb_array
+                    original_gen_image_padding, _ = self.G(x_real_padding, c_trg)
+                    perturbed_gen_image_padding, _ = self.G(x_adv_padding, c_trg)
+                    padding_result_list.append(x_adv_padding)
+                    padding_result_list.append(original_gen_image_padding)
+                    padding_result_list.append(perturbed_gen_image_padding)
+                    results = calculate_and_save_metrics(original_gen_image_padding, perturbed_gen_image_padding, "크기조정패딩", results)
+
+                x_real_transforms, x_adv_transforms = random_image_transforms(x_real, perturbed_image)
+                with torch.no_grad():
+                    remain_perturb_array = analyze_perturbation(x_adv_transforms - x_real_transforms)
+                    results["이미지변환"]["total_remain_map"] += remain_perturb_array
+                    original_gen_image_transforms, _ = self.G(x_real_transforms, c_trg)
+                    perturbed_gen_image_transforms, _ = self.G(x_adv_transforms, c_trg)
+                    transforms_result_list.append(x_adv_transforms)
+                    transforms_result_list.append(original_gen_image_transforms)
+                    transforms_result_list.append(perturbed_gen_image_transforms)
+                    results = calculate_and_save_metrics(original_gen_image_transforms, perturbed_gen_image_transforms, "이미지변환", results)
+
+                with torch.no_grad():
+                    x_real_np = x_real.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                    perturbed_image_np = perturbed_image.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                    invisible_lpips_value = self.lpips_loss(x_real, perturbed_image).mean()
+                    invisible_psnr_value = psnr(x_real_np, perturbed_image_np, data_range=2.0)
+                    invisible_ssim_value = ssim(x_real_np, perturbed_image_np, data_range=2.0, win_size=3, channel_axis=2)
+                    total_invisible_lpips += invisible_lpips_value
+                    total_invisible_psnr += invisible_psnr_value
+                    total_invisible_ssim += invisible_ssim_value
+                    episode += 1
+
+            all_result_lists = [noattack_result_list, jpeg_result_list, opencv_result_list,
+                                median_result_list, padding_result_list, transforms_result_list]
+            row_images = []
+            for result_list in all_result_lists:
+                row_concat = torch.cat(result_list, dim=3)
+                row_images.append(row_concat)
+            spacing = 10
+            blank_image = torch.ones_like(row_images[0][:, :, :spacing, :]) * 1.0
+            vertical_concat_list = [row_images[0]]
+            for i in range(1, len(row_images)):
+                vertical_concat_list.append(blank_image)
+                vertical_concat_list.append(row_images[i])
+            x_concat = torch.cat(vertical_concat_list, dim=2)
+            result_path = os.path.join(result_dir, '{}-images.jpg'.format(infer_img_idx + 1))
+            save_image(self.denorm(x_concat.data.cpu()), result_path, nrow=1, padding=0)
+            print(f"[RoundRobin Policy] Result saved: {result_path}")
+
+            if infer_img_idx >= (self.inference_image_num - 1):
+                break
+
+        total_images = infer_img_idx + 1
+        score = print_comprehensive_metrics(results, episode, total_invisible_psnr, total_invisible_ssim,
+                                            total_invisible_lpips, total_images)
+        train_flag = False
+        visualize_actions(action_history, image_indices, attr_indices, step_indices, train_flag)
+        return score
+
+
     def build_model(self):
         self.G = Generator(self.g_conv_dim, self.c_dim, self.g_repeat_num)
         self.D = Discriminator(self.image_size, self.d_conv_dim, self.c_dim, self.d_repeat_num)
